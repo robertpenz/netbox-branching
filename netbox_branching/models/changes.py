@@ -105,10 +105,18 @@ class ObjectChange(ObjectChange_):
 
         # Creating a new object
         if self.action == ObjectChangeActionChoices.ACTION_CREATE:
+            # Use the "clean" postchange data (private/denormalized fields such as `_path`
+            # stripped) rather than the raw snapshot. Private fields may reference objects
+            # (e.g. dcim.CablePath) that are excluded from change logging and recomputed
+            # per-schema by NetBox's own signals; replaying a branch-local ID for one of
+            # these into main either fails validation or silently misdirects the
+            # reference. This mirrors get_merge_data(), which already does the same for
+            # UPDATE actions.
+            data = self.postchange_data_clean
             if hasattr(model, 'deserialize_object'):
-                instance = model.deserialize_object(self.postchange_data, pk=self.changed_object_id)
+                instance = model.deserialize_object(data, pk=self.changed_object_id)
             else:
-                instance = deserialize_object(model, self.postchange_data, pk=self.changed_object_id)
+                instance = deserialize_object(model, data, pk=self.changed_object_id)
             full_clean_with_file_check(instance.object, logger)
 
             # For MPTT models, clear the tree fields and bypass the raw save path so

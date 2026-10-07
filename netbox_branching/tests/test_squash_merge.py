@@ -10,7 +10,7 @@ from django.test import RequestFactory
 from django.urls import reverse
 
 from circuits.models import Circuit, CircuitTermination, CircuitType, Provider
-from dcim.models import Device, Interface, Location, MACAddress, Region, Site, VirtualChassis
+from dcim.models import Cable, Device, Interface, Location, MACAddress, Region, Site, VirtualChassis
 from ipam.models import IPAddress
 from netbox.context_managers import event_tracking
 from netbox_branching.choices import BranchMergeStrategyChoices, BranchStatusChoices
@@ -365,6 +365,86 @@ class SquashMergeTestCase(BaseMergeTests, FastTeardownTransactionTestCase):
         self.assertFalse(Device.objects.filter(id=device_id).exists())
         self.assertFalse(Interface.objects.filter(id=iface_id).exists())
         self.assertFalse(IPAddress.objects.filter(id=ip_id).exists())
+
+    def test_merge_create_then_update_with_cable_path(self):
+        """
+        Regression test for the squash merge strategy replaying a branch-local
+        CablePath reference into main.
+
+        dcim.CablePath is listed in INCLUDE_MODELS: it lacks ChangeLoggingMixin, so it is
+        never itself replayed by a merge, and each branch (schema) computes its own
+        CablePath rows with their own, independently-sequenced IDs. When an interface is
+        created in a branch and then cabled, CablePath.save() back-fills the interface's
+        `_path` FK via a bulk queryset .update() (bypassing change logging). If that
+        interface is saved again afterwards -- e.g. a provisioning script doing a final
+        pass over the objects it touched -- the now-current `_path` value is captured in
+        an ordinary UPDATE ObjectChange.
+
+        SquashMergeStrategy collapses that raw (unfiltered) UPDATE postchange_data into
+        the interface's still-pending CREATE payload (CollapsedChange._add_change_update),
+        and ObjectChange.apply() deserializes a CREATE using the raw postchange_data
+        without stripping private fields (unlike the UPDATE path's get_merge_data(), which
+        already strips them via postchange_data_clean). The result: merge tries to create
+        the interface in main with `_path` pointing at a CablePath ID that only exists in
+        the branch schema, raising ValidationError (or, if main happens to have an
+        unrelated CablePath with a colliding ID, silently misdirecting the interface's
+        path) instead of leaving NetBox's own signals to recompute the path in main.
+        """
+        request = RequestFactory().get(reverse('home'))
+        request.id = uuid.uuid4()
+        request.user = self.user
+
+        with event_tracking(request):
+            site = Site.objects.create(name='Test Site', slug='test-site')
+            far_device = Device.objects.create(
+                name='Far Device',
+                device_type=self.device_type,
+                role=self.device_role,
+                site=site,
+            )
+            far_iface = Interface.objects.create(device=far_device, name='eth0', type='1000base-t')
+
+        branch = self._create_and_provision_branch()
+
+        request2 = RequestFactory().get(reverse('home'))
+        request2.id = uuid.uuid4()
+        request2.user = self.user
+
+        with activate_branch(branch), event_tracking(request2):
+            device = Device.objects.create(
+                name='Test Device',
+                device_type=self.device_type,
+                role=self.device_role,
+                site=site,
+            )
+            iface = Interface.objects.create(device=device, name='eth0', type='1000base-t')
+            Cable(
+                a_terminations=[iface],
+                b_terminations=[Interface.objects.get(pk=far_iface.pk)],
+            ).save()
+
+            # A subsequent save on the newly-created interface -- e.g. a provisioning
+            # script's final pass over everything it touched -- picks up the `_path`
+            # that CablePath.save() just wrote via a bulk queryset .update(), and this
+            # gets captured as a normal UPDATE ObjectChange.
+            iface.refresh_from_db()
+            iface.snapshot()
+            iface.description = 'configured'
+            iface.save()
+
+            iface_id = iface.id
+
+        # Previously raised: ValidationError({'_path': ['cable path instance with id ... is not a valid choice.']})
+        branch.merge(user=self.user, commit=True)
+
+        merged_iface = Interface.objects.get(id=iface_id)
+        self.assertEqual(merged_iface.description, 'configured')
+        self.assertIsNotNone(merged_iface.cable_id)
+        # The branch-local CablePath ID must not be carried over into main: it isn't
+        # recomputed here (squash merge does not retrace paths after CREATE — #150, see
+        # test_merge_cable_path_recalculation), but it must not crash or point at an
+        # unrelated object that happens to share the ID in main either.
+        self.assertIsNone(merged_iface._path_id)
 
     def test_merge_device_dual_primary_ip4_and_ip6(self):
         """
