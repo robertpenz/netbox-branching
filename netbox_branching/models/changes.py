@@ -131,6 +131,7 @@ class ObjectChange(ObjectChange_):
                     getattr(instance.object, accessor_name).set(object_list)
             else:
                 instance.save(using=using)
+                self._backfill_pre_save_fields(instance.object, using)
 
         # Modifying an object
         elif self.action == ObjectChangeActionChoices.ACTION_UPDATE:
@@ -154,6 +155,41 @@ class ObjectChange(ObjectChange_):
                 instance.delete(using=using)
             except model.DoesNotExist:
                 logger.debug(f'{model._meta.verbose_name} ID {self.changed_object_id} already deleted; skipping')
+
+    def _backfill_pre_save_fields(self, obj, using):
+        """
+        Replaying a CREATE change goes through deserialize_object() /
+        DeserializedObject.save(), which always performs a raw save (Django's
+        save_base(..., raw=True)). A raw save skips every field's pre_save()
+        hook, so any field whose value is normally computed there - NetBox's
+        NaturalOrderingField ('_name') and Django's auto_now / auto_now_add
+        DateFields ('created', 'last_updated') - is left exactly as the
+        change's snapshot carried it. If the snapshot never carried a value
+        for one of these fields, it stays permanently blank/null in the
+        target schema (observed on 'created'/'last_updated' and '_name' for
+        objects created inside a merged branch).
+
+        Recompute any such field that still has no value. auto_now /
+        auto_now_add fields are backfilled from this change's own recorded
+        time (the true original creation/update time), not the current time,
+        since applying a merge is not when the change actually happened.
+        Other pre_save-computed fields (e.g. '_name') are recomputed fresh
+        from the now-correct underlying data. A plain update() is used so
+        this never re-triggers pre_save() itself.
+        """
+        model = type(obj)
+        values = {}
+        for field in model._meta.local_concrete_fields:
+            if type(field).pre_save is models.Field.pre_save:
+                continue
+            if getattr(obj, field.attname):
+                continue
+            if getattr(field, 'auto_now', False) or getattr(field, 'auto_now_add', False):
+                values[field.attname] = self.time
+            else:
+                values[field.attname] = field.pre_save(obj, add=True)
+        if values:
+            model.objects.using(using).filter(pk=obj.pk).update(**values)
 
     apply.alters_data = True
 
