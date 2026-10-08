@@ -105,14 +105,20 @@ class ObjectChange(ObjectChange_):
 
         # Creating a new object
         if self.action == ObjectChangeActionChoices.ACTION_CREATE:
-            # Use the "clean" postchange data (private/denormalized fields such as `_path`
-            # stripped) rather than the raw snapshot. Private fields may reference objects
-            # (e.g. dcim.CablePath) that are excluded from change logging and recomputed
-            # per-schema by NetBox's own signals; replaying a branch-local ID for one of
-            # these into main either fails validation or silently misdirects the
-            # reference. This mirrors get_merge_data(), which already does the same for
-            # UPDATE actions.
-            data = self.postchange_data_clean
+            # Strip `_path` (dcim.Interface/CableTermination's CablePath FK) from the
+            # snapshot before replaying. CablePath lacks ChangeLoggingMixin, so it is
+            # excluded from change logging entirely and each schema computes its own
+            # rows with independently-sequenced IDs; replaying a branch-local `_path` ID
+            # into main either fails validation or silently misdirects the reference.
+            # NetBox's own signals recompute it in main once the real FK (`cable`) is in
+            # place, so dropping it here is always safe.
+            #
+            # Deliberately NOT using postchange_data_clean()/get_clean_data() here: that
+            # strips *every* key starting with `_` plus `created`/`last_updated`, which
+            # is correct for diff *display* but not for replay - `_name` (NetBox's
+            # natural-sort field) and the timestamps are real data we want to keep when
+            # the snapshot happens to carry them.
+            data = {k: v for k, v in self.postchange_data.items() if k != '_path'}
             if hasattr(model, 'deserialize_object'):
                 instance = model.deserialize_object(data, pk=self.changed_object_id)
             else:
