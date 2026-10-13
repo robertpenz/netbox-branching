@@ -420,6 +420,16 @@ def diff_for_merge(source, destination, top_level=True):
             # equality, so a key whose value was None is still recognised as a
             # deletion rather than treated as unchanged.
             delta[key] = DELETED
+        elif not in_destination and top_level and not destination:
+            # `destination` itself is empty — a degenerate pre/post snapshot (e.g. an
+            # ObjectChange whose prechange_data is None, which get_clean_data() turns
+            # into {}), not a real removal of this one field. Every top-level key would
+            # otherwise look "missing from destination" and fall through to the `else`
+            # below, forcing it to None — including non-nullable fields, which breaks
+            # full_clean() (e.g. custom_field_data must stay a dict). Skip the key
+            # instead: with no reliable before/after value for it, leaving the target
+            # untouched is safer than overwriting it with None.
+            continue
         else:
             delta[key] = dst_val
     return delta

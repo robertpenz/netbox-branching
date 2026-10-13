@@ -12,6 +12,8 @@ from django.db import connections
 from django.test import RequestFactory, SimpleTestCase
 from django.urls import reverse
 
+from core.choices import ObjectChangeActionChoices
+from core.models import ObjectChange as ObjectChange_
 from dcim.choices import DeviceFaceChoices
 from dcim.models import (
     Cable,
@@ -342,6 +344,84 @@ class BaseMergeTests:
 
         device = Device.objects.get(id=device_id)
         self.assertEqual(device.local_context_data, original)
+
+    def test_revert_update_with_empty_prechange_snapshot(self):
+        """
+        Regression test: reverting an ACTION_UPDATE ObjectChange whose prechange_data is
+        None must not crash.
+
+        get_merge_data(reverse=True) builds its payload via diff_for_merge(postchange_data_clean,
+        prechange_data_clean). get_clean_data() returns {} whenever the raw *_data field is None,
+        so an empty prechange_data makes every top-level key "missing from the destination".
+        Before the fix, diff_for_merge()'s top-level branch didn't special-case this: for a key
+        present in source but absent from destination, it fell through to `delta[key] = dst_val`,
+        and since the key was also absent from destination, dst_val was None - every untouched
+        field (including custom_field_data, and required fields like name/slug) was forced to
+        None rather than left alone.
+
+        update_object() then did setattr(instance, 'custom_field_data', None), and NetBox's own
+        CustomFieldsMixin.clean() unconditionally calls self.custom_field_data.items(), raising
+        AttributeError: 'NoneType' object has no attribute 'items'.
+
+        A real prechange_data of None on an UPDATE change is a NetBox/plugin-internal detail
+        (e.g. an instance saved without ever being snapshotted); this test constructs that
+        condition directly to exercise undo() without depending on how it arises in practice.
+        """
+        site_ct = ContentType.objects.get_for_model(Site)
+        cf1 = CustomField.objects.create(name='cf1', required=False)
+        cf1.object_types.set([site_ct])
+
+        request = RequestFactory().get(reverse('home'))
+        request.id = uuid.uuid4()
+        request.user = self.user
+
+        # In main: create a site with a custom field already set.
+        with event_tracking(request):
+            site = Site.objects.create(name='Site 1', slug='site-1', description='Original')
+            site.snapshot()
+            site.custom_field_data['cf1'] = 'main-value'
+            site.save()
+        site_id = site.id
+
+        branch = self._create_and_provision_branch()
+
+        # Record an UPDATE change directly, with prechange_data=None - the degenerate
+        # snapshot that reaches undo() in production. postchange_data is a real
+        # serialization so the forward (merge) direction behaves normally.
+        with activate_branch(branch):
+            current = Site.objects.using(branch.connection_name).get(pk=site_id)
+            postchange_data = current.serialize_object()
+            postchange_data['description'] = 'Updated in branch'
+
+            ObjectChange_.objects.using(branch.connection_name).create(
+                action=ObjectChangeActionChoices.ACTION_UPDATE,
+                changed_object_type=site_ct,
+                changed_object_id=site_id,
+                object_repr=str(current),
+                prechange_data=None,
+                postchange_data=postchange_data,
+                user=self.user,
+                user_name=self.user.username,
+                request_id=uuid.uuid4(),
+            )
+
+        branch.merge(user=self.user, commit=True)
+
+        site = Site.objects.get(id=site_id)
+        self.assertEqual(site.description, 'Updated in branch')
+        self.assertEqual(site.custom_field_data, {'cf1': 'main-value'})
+
+        # The change carries no prechange snapshot, so there is no real "before" value
+        # to restore - the fix's job is to leave the object exactly as merge left it
+        # rather than crash (previously: AttributeError on custom_field_data) or corrupt
+        # required fields (name/slug/status forced to None, failing full_clean()).
+        branch.revert(user=self.user, commit=True)
+
+        site = Site.objects.get(id=site_id)
+        self.assertEqual(site.name, 'Site 1')
+        self.assertEqual(site.slug, 'site-1')
+        self.assertEqual(site.description, 'Updated in branch')
+        self.assertEqual(site.custom_field_data, {'cf1': 'main-value'})
 
     def test_merge_basic_delete(self):
         """
